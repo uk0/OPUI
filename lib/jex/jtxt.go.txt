@@ -1,0 +1,945 @@
+package jex
+
+import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"reflect"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+const indentChar = '\t'
+
+var scanerType = reflect.TypeOf((*fmt.Scanner)(nil)).Elem()
+
+type sortTDoc struct {
+	v  []*TDoc
+	fn func(a, b *TDoc) bool
+}
+
+func (p *sortTDoc) Len() int {
+	return len(p.v)
+}
+
+func (p *sortTDoc) Less(i, j int) bool {
+	return p.fn(p.v[i], p.v[j])
+}
+
+func (p *sortTDoc) Swap(i, j int) {
+	p.v[i], p.v[j] = p.v[j], p.v[i]
+}
+
+func (this *TDoc) Sort(fn func(a, b *TDoc) bool) {
+	if fn == nil {
+		fn = func(a, b *TDoc) bool {
+			return a.key < b.key
+		}
+	}
+	sort.Sort(&sortTDoc{this.subs, fn})
+}
+
+type TDoc struct {
+	parent *TDoc
+	subs   []*TDoc
+	index  map[string]*TDoc
+	key    string
+	val    string
+	named  int32
+}
+
+func NewTDoc() *TDoc {
+	return new(TDoc)
+}
+
+func (this *TDoc) SetKey(k string) {
+	if this.parent == nil {
+		this.key = k
+		return
+	}
+
+	if this.key == "" {
+		if k != "" {
+			this.parent.named++
+			if this.parent.index != nil {
+				this.parent.index[k] = this
+			}
+		}
+	} else if k == "" {
+		this.parent.named--
+		if this.parent.index != nil {
+			delete(this.parent.index, this.key)
+		}
+
+	} else if k != this.key && this.parent.index != nil {
+		delete(this.parent.index, this.key)
+		this.parent.index[k] = this
+	}
+
+	this.key = k
+}
+
+func (this *TDoc) Key() string {
+	return this.key
+}
+
+func (this *TDoc) getIndex() map[string]*TDoc {
+	if this.index == nil && this.named > 0 {
+		this.index = make(map[string]*TDoc, 0)
+		// 补上索引
+		for _, sub := range this.subs {
+			if sub.key != "" {
+				this.index[sub.key] = sub
+			}
+		}
+	}
+	return this.index
+}
+
+func (this *TDoc) Len() int {
+	return len(this.subs)
+}
+
+func (this *TDoc) ChildrenKeys() (keys []string) {
+	for _, p := range this.subs {
+		keys = append(keys, p.key)
+	}
+	return
+}
+
+func (this *TDoc) SetLen(n int) {
+	if n < 0 {
+		panic("subscript underflow.")
+	}
+	if n < len(this.subs) {
+		for i := n; i < len(this.subs); i++ {
+			this.subs[i].Detach()
+		}
+		this.subs = this.subs[:n]
+		return
+	}
+	for i := len(this.subs); i < n; i++ {
+		this.subs = append(this.subs, new(TDoc))
+	}
+}
+
+func (this *TDoc) AddChild(sub *TDoc) {
+	if sub == nil {
+		return
+	}
+
+	if sub.parent != nil {
+		sub = sub.Clone()
+	}
+	this.subs = append(this.subs, sub)
+	if sub.key != "" {
+		this.named++
+		if this.index != nil {
+			this.index[sub.key] = sub
+		}
+	}
+}
+
+func (this *TDoc) Child(idx int) *TDoc {
+	return this.subs[idx]
+}
+
+func (this *TDoc) ChildByKey(k string, createMissing bool) *TDoc {
+	if k == "" {
+		return nil
+	}
+
+	m := this.getIndex()
+	if m != nil {
+		p, ok := m[k]
+		if ok {
+			return p
+		}
+	}
+
+	if createMissing {
+		p := new(TDoc)
+		p.SetKey(k)
+		this.AddChild(p)
+		return p
+	}
+
+	return nil
+}
+
+func (this *TDoc) Clone() *TDoc {
+	p := new(TDoc)
+	for _, sub := range this.subs {
+		p.AddChild(sub.Clone())
+	}
+	p.key, p.val = this.key, this.val
+	return p
+}
+
+// 从把src的子节点复制到本结点下
+// 如果在复制前本结点非空, 则原有数据也会保留
+// 重名子节点的处理同 AddChild
+func (this *TDoc) CopyChildrenFrom(src *TDoc) {
+	if src == this || src == nil {
+		return
+	}
+
+	for _, sub := range src.subs {
+		this.AddChild(sub.Clone())
+	}
+}
+
+func (this *TDoc) Detach() *TDoc {
+	if this.parent == nil {
+		return this
+	}
+
+	if this.key != "" {
+		this.parent.index = nil
+	}
+
+	sz := len(this.parent.subs)
+	for i := 0; i < sz; i++ {
+		if this.parent.subs[i] == this {
+			this.parent.subs[i] = nil
+			this.parent.subs = append(this.parent.subs[:i], this.parent.subs[i+1:]...)
+			break
+		}
+	}
+
+	this.parent = nil
+	return this
+}
+
+// 根据键值路径查找结点
+// 前导'/'等同于无前导'/', 连续的多个'/'等同于单个'/'
+// 目前的版本不支持".."
+func (this *TDoc) InnerNodeByKeyPath(path string, createMissing bool) *TDoc {
+	if path == "" {
+		return this
+	}
+	parts := strings.Split(path, "/")
+	p := this
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		p = p.ChildByKey(part, createMissing)
+		if p == nil {
+			if createMissing {
+				panic("internal error")
+			}
+			break
+		}
+	}
+	return p
+}
+
+func (this *TDoc) Clear() {
+	this.index = nil
+	this.val = ""
+	this.subs = make([]*TDoc, 0)
+	this.named = 0
+}
+
+// 键值路径, 不存在时返回空字符串, 当前节点等于from时返回"/"
+// from应为本结点的祖先, 否则路径不存在
+// 路径中任意节点的key为空时,键值路径也不存在
+func (this *TDoc) KeyPath(from *TDoc) string {
+	if this == from {
+		return "/"
+	}
+	var path []*TDoc
+	node := this
+	for node != nil && node != from {
+		if node.key == "" {
+			return ""
+		}
+		path = append(path, node)
+		node = node.Parent()
+	}
+	if node != from {
+		return ""
+	}
+	var ret string
+	for i := len(path) - 1; i >= 0; i-- {
+		ret += "/" + path[i].key
+	}
+	return ret
+}
+
+// 枚举出所有符合条件的内层结点
+func (this *TDoc) InnerNodes(_ignoreVoid, _leafOnly, _namedOnly bool) []*TDoc {
+	ret := []*TDoc{}
+	for _, c := range this.subs {
+		add := false
+		hasChild := len(c.subs) > 0
+		if hasChild && _leafOnly {
+			add = false
+		} else if c.val == "" && _ignoreVoid {
+			add = false
+		} else if c.key == "" && _namedOnly {
+			add = false
+		}
+
+		if add {
+			ret = append(ret, c)
+		}
+
+		if hasChild {
+			ret = append(ret, c.InnerNodes(_ignoreVoid, _namedOnly, _leafOnly)...)
+		}
+	}
+
+	return ret
+}
+
+// 枚举出所有符合条件的内层结点路径
+func (this *TDoc) InnerKeyPaths(_ignoreVoid, _leafOnly bool) (paths []string) {
+	for _, sub := range this.InnerNodes(_ignoreVoid, _leafOnly, true) {
+		paths = append(paths, sub.KeyPath(this))
+	}
+	return paths
+}
+
+// 父节点
+func (this *TDoc) Parent() *TDoc {
+	return this.parent
+}
+
+// 保存成文件
+func (this *TDoc) SaveFile(path string) error {
+	return this.SaveFile1(path, false)
+}
+
+// 保存成文件
+func (this *TDoc) SaveFile1(path string, compress bool) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return this.Save1(file, compress)
+}
+
+// 保存
+func (this *TDoc) Save(w io.Writer) error {
+	return this.Save1(w, false)
+}
+
+// 保存
+func (this *TDoc) Save1(w io.Writer, compress bool) error {
+	if compress {
+		zw, err := gzip.NewWriterLevel(w, -1)
+		if err != nil {
+			return err
+		}
+		defer zw.Close()
+		w = zw
+	}
+	bw, ok := w.(*bufio.Writer)
+	if !ok {
+		bw = bufio.NewWriter(w)
+	}
+
+	defer bw.Flush()
+
+	if err := this.save(bw, 0); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func writeKey(w *bufio.Writer, s string) {
+	for _, r := range s {
+		switch r {
+		case '\\':
+			w.WriteRune('\\')
+			w.WriteRune('\\')
+		case '\n':
+			w.WriteRune('\\')
+			w.WriteRune('n')
+		case '\r':
+			w.WriteRune('\\')
+			w.WriteRune('r')
+		case '\t':
+			w.WriteRune('\\')
+			w.WriteRune('t')
+		case ' ':
+			w.WriteRune('\\')
+			w.WriteRune('s')
+		case '=':
+			w.WriteRune('\\')
+			w.WriteRune('=')
+		default:
+			w.WriteRune(r)
+		}
+	}
+}
+
+func (this *TDoc) save(w *bufio.Writer, indent int) error {
+	for i := 0; i < indent-1; i++ {
+		w.WriteRune(indentChar)
+	}
+
+	if this.key != "" {
+		writeKey(w, this.key)
+		w.WriteRune(' ')
+	}
+
+	w.WriteRune('=')
+
+	if this.val != "" {
+		w.WriteRune(' ')
+		w.WriteString(this.val)
+	}
+
+	w.WriteRune('\n')
+
+	for _, sub := range this.subs {
+		if err := sub.save(w, indent+1); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func skipSpace(reader *bufio.Reader) rune {
+	var ch rune
+	for {
+		ch, _, _ = reader.ReadRune()
+		if ch != ' ' && ch != '\t' {
+			reader.UnreadRune()
+			break
+		}
+	}
+	return ch
+}
+
+func readKey(reader *bufio.Reader) string {
+	var buf bytes.Buffer
+	var ch rune
+Outer:
+	for {
+		ch, _, _ = reader.ReadRune()
+		switch ch {
+		case '\\':
+			ch, _, _ = reader.ReadRune()
+			switch ch {
+			case 0:
+				break Outer
+			case '\n': // 行尾的反斜杠
+				break Outer
+			case 'n':
+				buf.WriteRune('\n')
+			case 'r':
+				buf.WriteRune('\r')
+			case '=':
+				buf.WriteRune('=')
+			default:
+				buf.WriteRune(ch)
+			}
+		case '=':
+			break Outer
+			break
+		case 0:
+			return buf.String()
+		default:
+			if ch <= 32 {
+				break Outer
+			}
+			buf.WriteRune(ch)
+		}
+	}
+	reader.UnreadRune()
+	return buf.String()
+}
+
+func readValue(reader *bufio.Reader) string {
+	var buf bytes.Buffer
+	var ch rune
+Outer:
+	for {
+		ch, _, _ = reader.ReadRune()
+		switch ch {
+		case '\r':
+			break Outer
+		case '\n':
+			break Outer
+		case 0:
+			return buf.String()
+		default:
+			buf.WriteRune(ch)
+		}
+	}
+	reader.UnreadRune()
+	return buf.String()
+}
+
+func readKeyValue(br *bufio.Reader) (string, string, rune, error) {
+	key := readKey(br)
+	ch := skipSpace(br)
+	var val string
+	if ch == '=' {
+		_, _, _ = br.ReadRune()
+		ch = skipSpace(br)
+		if ch != '\r' && ch != '\n' && ch != 0 {
+			if ch < 32 {
+				return "", "", 0, StrErr("Illegal space/control char detected")
+			}
+			val = readValue(br)
+			//Println(val)
+			ch = skipSpace(br)
+		}
+	}
+	return key, val, ch, nil
+}
+
+func nextLine(br *bufio.Reader, ch rune) {
+	if ch == 0 {
+		return
+	}
+	if ch == '\r' {
+		br.ReadRune()
+		ch, _, _ = br.ReadRune()
+		if ch != '\n' {
+			br.UnreadRune()
+		}
+	} else if ch == '\n' {
+		br.ReadRune()
+		ch, _, _ = br.ReadRune()
+		if ch != '\r' {
+			br.UnreadRune()
+		}
+	}
+}
+
+// lineLimit: 最多读的行数, 0表示无限
+func LoadTDocFile1(path string, lineLimit uint64) (*TDoc, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return LoadTDoc1(file, lineLimit)
+}
+
+func LoadTDocFile(path string) (*TDoc, error) {
+	return LoadTDocFile1(path, 0)
+}
+
+func LoadTDoc(r io.Reader) (*TDoc, error) {
+	return LoadTDoc1(r, 0)
+}
+
+// lineLimit: 最多读的行数, 0表示无限
+func LoadTDoc1(r io.Reader, lineLimit uint64) (*TDoc, error) {
+
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReader(r)
+	}
+
+	gzh, err := br.Peek(2)
+	if len(gzh) < 2 {
+		return nil, err
+	}
+
+	if gzh[0] == 0x1f && gzh[1] == 0x8b {
+		zr, err := gzip.NewReader(br)
+		if err != nil {
+			return nil, err
+		}
+		defer zr.Close()
+		br = bufio.NewReader(zr)
+	}
+
+	// root node
+	var ch rune
+	ch, _, _ = br.ReadRune()
+	if ch <= 32 {
+		return nil, StrErr("First line must not indented.")
+	}
+	br.UnreadRune()
+	key, val, ch, err := readKeyValue(br)
+	if err != nil {
+		return nil, err
+	}
+	nextLine(br, ch)
+
+	root := new(TDoc)
+	root.key = key
+	root.val = val
+
+	const MaxIndent = 128
+	var tracks [MaxIndent + 1]*TDoc // 每个层次的父结点
+	tracks[0] = root
+
+	var nc uint64 = 1
+	indent := 0
+
+Outer:
+	for lineLimit == 0 || nc < lineLimit {
+		i := 0
+		for {
+			ch, _, _ = br.ReadRune()
+			if ch != indentChar {
+				if ch == '\r' || ch == '\n' || ch == 0 {
+					break Outer
+				} else if ch <= 32 {
+					return nil, StrErr("Illegal indent char detected")
+				}
+				br.UnreadRune()
+				break
+			}
+			i++
+		}
+
+		key, val, ch, err := readKeyValue(br)
+		if err != nil {
+			return nil, err
+		}
+
+		di := i - indent
+		if di > 0 {
+			if di > 1 {
+				return nil, StrErr("Jump indent in line")
+			}
+			indent++
+			if indent >= MaxIndent {
+				return nil, StrErr("Indent exceed " + strconv.Itoa(MaxIndent))
+			}
+		} else {
+			indent = i
+		}
+
+		c := new(TDoc)
+		c.key = key
+		c.val = val
+
+		parent := tracks[indent]
+		if parent == nil {
+			return nil, StrErr("Jump indent in line")
+		}
+		parent.AddChild(c)
+
+		tracks[indent+1] = c
+
+		nextLine(br, ch)
+		nc++
+	}
+
+	return root, nil
+}
+
+func (this *TDoc) SetValue(val interface{}) (err error) {
+	this.val, err = PersistString(val)
+	if err != nil && IsDebugOn() {
+		Warn(err)
+	}
+	return
+}
+
+func (this *TDoc) Value(ptr interface{}) (err error) {
+	_, err = PersistSscan(this.val, ptr)
+	if err != nil && IsDebugOn() {
+		Warn(err)
+	}
+	return
+}
+
+//func (this *TDoc) Value() string {
+//	return this.val
+//}
+
+func (this *TDoc) HasValue() bool {
+	return this.val != ""
+}
+
+func (this *TDoc) HasChildren() bool {
+	return this.Len() != 0
+}
+
+// 返回所有子节点
+// 此函数返回内部slice的引用, 不要修改此slice
+func (this *TDoc) Childdren() []*TDoc {
+	return this.subs
+}
+
+/*
+func (this *TDoc) writeAttr(key string, val interface{}) error {
+	sub := this.ChildByKey(key, true)
+	return sub.SetNodeData(val)
+
+}
+
+func (this *TDoc) readAttr(key string, ptr interface{}) error {
+	sub := this.ChildByKey(key, false)
+	if sub == nil {
+		return errors.New(`No such attr: \"` + key + `"`)
+	}
+	return sub.ReadVal(ptr)
+}
+*/
+
+// 写属性
+func (this *TDoc) WriteAttr(key string, data interface{}) error {
+	p := this.InnerNodeByKeyPath(key, true)
+	if p == nil {
+		return errNoSuchKey
+	}
+	if p == this {
+		return errors.New("empty key is not allowed")
+	}
+	if itd, ok := data.(*TDoc); ok {
+		p.Clear()
+		p.CopyChildrenFrom(itd)
+		return nil
+	}
+
+	return p.SetValue(data)
+}
+
+// 读属性
+func (this *TDoc) ReadAttr(key string, ptr interface{}) error {
+	p := this.InnerNodeByKeyPath(key, false)
+	if p == nil {
+		return errNoSuchKey
+	}
+	if itd, ok := ptr.(*TDoc); ok {
+		itd.CopyChildrenFrom(p)
+		return nil
+	}
+	if itd, ok := ptr.(**TDoc); ok {
+		(*itd).CopyChildrenFrom(p)
+		return nil
+	}
+	return p.Value(ptr)
+}
+
+// 完整的文档
+func (this *TDoc) String() string {
+	s, err := this.toString()
+	if err != nil {
+		Warn(err)
+	}
+	return s
+}
+
+func (this *TDoc) toString() (string, error) {
+	buf := &bytes.Buffer{}
+	err := this.Save1(buf, false)
+	if err != nil {
+		return "", err
+	}
+	return buf.String(), nil
+}
+
+// 加载字符串中的TDoc
+func LoadTDocStr1(s string, lineLimit uint64) (*TDoc, error) {
+	sr := (*StringReader)(&s)
+	return LoadTDoc1(sr, lineLimit)
+}
+
+// 加载字符串中的TDoc
+func LoadTDocStr(s string) (*TDoc, error) {
+	sr := (*StringReader)(&s)
+	return LoadTDoc1(sr, 0)
+}
+
+func tdocUnmarshalPV(doc *TDoc, pv reflect.Value) error {
+	v := pv.Elem()
+	if !v.IsValid() {
+		return errors.New("nil pointer")
+	}
+
+	if reflect.PtrTo(v.Type()).Implements(scanerType) {
+		// 直接解码
+		tmp := reflect.New(v.Type())
+		err := doc.Value(tmp.Interface())
+		if err != nil {
+			return err
+		}
+		v.Set(tmp.Elem())
+		return nil
+	}
+
+	switch v.Type().Kind() {
+	case reflect.Ptr:
+		if !doc.HasValue() && !doc.HasChildren() {
+			// doc是空, 空指针
+			v.Set(reflect.Zero(v.Type()))
+			return nil
+		}
+		if !v.Elem().IsValid() {
+			// 非空, 新建数据, 然后解码
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		return tdocUnmarshalPV(doc, v)
+	case reflect.Struct:
+		for i := 0; i < doc.Len(); i++ {
+			p := doc.Child(i)
+			k := p.Key()
+			if k == "" {
+				continue
+			}
+			fv := v.FieldByName(k)
+			if !fv.IsValid() {
+				// no such field
+				continue
+			}
+			ft, ok := v.Type().FieldByName(k)
+			if !ok || ft.Tag == "_" {
+				// skip
+				continue
+			}
+			err := tdocUnmarshalPV(p, fv.Addr())
+			if err != nil {
+				return err
+			}
+		}
+	case reflect.Array:
+		n := doc.Len()
+		if n > v.Len() {
+			n = v.Len()
+		}
+		for i := 0; i < n; i++ {
+			sv := v.Index(i)
+			p := doc.Child(i)
+			err := tdocUnmarshalPV(p, sv.Addr())
+			if err != nil {
+				return err
+			}
+		}
+	case reflect.Slice:
+		n := doc.Len()
+		v.Set(reflect.MakeSlice(v.Type(), n, n))
+		for i := 0; i < n; i++ {
+			sv := v.Index(i)
+			p := doc.Child(i)
+			err := tdocUnmarshalPV(p, sv.Addr())
+			if err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		v.Set(reflect.MakeMap(v.Type()))
+		et := v.Type().Elem()
+		for i := 0; i < doc.Len(); i++ {
+			p := doc.Child(i)
+			k := p.Key()
+			if k == "" {
+				continue
+			}
+			mv := reflect.New(et)
+			err := tdocUnmarshalPV(p, mv)
+			if err != nil {
+				return err
+			}
+			v.SetMapIndex(reflect.ValueOf(k), mv.Elem())
+		}
+	default:
+		tmp := reflect.New(v.Type())
+		err := doc.Value(tmp.Interface())
+		if err != nil {
+			return err
+		}
+		v.Set(tmp.Elem())
+	}
+	return nil
+}
+
+// 把TDoc中的内容解码到ptr指向的对象中
+func (this *TDoc) Unmarshal(ptr interface{}) error {
+	v := reflect.ValueOf(ptr)
+	if v.Type().Kind() != reflect.Ptr {
+		return errors.New("not a pointer")
+	}
+
+	return tdocUnmarshalPV(this, v)
+}
+
+func tdocMarshalV(v reflect.Value) (*TDoc, error) {
+	if !v.IsValid() {
+		// 这里保证了所有的空指针都是"". 不是"nil"
+		return NewTDoc(), nil
+	}
+
+	if reflect.PtrTo(v.Type()).Implements(scanerType) {
+		// 直接编码
+		doc := NewTDoc()
+		err := doc.SetValue(v.Interface())
+		return doc, err
+	}
+
+	switch v.Type().Kind() {
+	case reflect.Ptr:
+		// 指针解引用
+		return tdocMarshalV(v.Elem())
+	case reflect.Struct:
+		// 逐个字段编码
+		doc := NewTDoc()
+		n := v.NumField()
+		for i := 0; i < n; i++ {
+			fv := v.Field(i)
+			ft := v.Type().Field(i)
+			if ft.Tag == "_" {
+				continue
+			}
+			p, err := tdocMarshalV(fv)
+			if err != nil {
+				return nil, err
+			}
+			p.SetKey(ft.Name)
+			doc.AddChild(p)
+		}
+		return doc, nil
+	case reflect.Array:
+		fallthrough
+	case reflect.Slice:
+		doc := NewTDoc()
+		n := v.Len()
+		for i := 0; i < n; i++ {
+			sv := v.Index(i)
+			p, err := tdocMarshalV(sv)
+			if err != nil {
+				return nil, err
+			}
+			doc.AddChild(p)
+		}
+		return doc, nil
+	case reflect.Map:
+		doc := NewTDoc()
+		for _, k := range v.MapKeys() {
+			mv := v.MapIndex(k)
+			p, err := tdocMarshalV(mv)
+			if err != nil {
+				return nil, err
+			}
+			p.SetKey(k.String())
+			doc.AddChild(p)
+		}
+		doc.Sort(nil)
+		return doc, nil
+	default:
+		// 直接编码
+		doc := NewTDoc()
+		err := doc.SetValue(v.Interface())
+		//doc.SetKey(keyName(v.Type().Name()))
+		return doc, err
+	}
+
+	panic("")
+}
+
+// 把对象编码成TDoc
+func TDocMarshal(a interface{}) (doc *TDoc, err error) {
+	v := reflect.ValueOf(a)
+	return tdocMarshalV(v)
+}

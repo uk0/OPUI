@@ -1,0 +1,28 @@
+{
+  "vert"  : false,
+  "split" : 0.4,
+	"left" : {
+    "vert"  : true,
+    "split" : 0.8,
+		"left"  : {
+    	"class" : "gui.TestPane",
+    	"param" : "The quick brown fox jumps over the lazy dog"
+    },
+  	"right" : {
+    	"class" : "gui.TestPane",
+    	"param" : "The quick brown fox jumps over the lazy dog"
+    }
+  },
+	"right"  : {
+    "vert"  : true,
+    "split" : 0.9,
+		"left"  : {
+    	"class" : "gui.TestPane",
+    	"param" : "张建新"
+    },
+    "right" :{
+  	   "class" : "gui.TestPane3D",
+  	    "param" : "Mark"
+      }
+    }
+}
