@@ -1,5 +1,5 @@
 # OPUI
- golang gui ，mac  windows and order
+ golang gui ，mac  windows and other
 
 # TODO 
  继续完善 openGl 的SDK
