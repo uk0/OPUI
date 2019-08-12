@@ -24,4 +24,4 @@
 
     ![](http://zmatsh.b0.upaiyun.com/OPUI_1.png)
 
-# 感谢群里面的老大哥 指点，项目我会继续往下写，待续。。
+## auth 陈成涛（Go的入门导师）
