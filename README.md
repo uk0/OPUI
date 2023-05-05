@@ -1,13 +1,14 @@
-# OPUI
- golang gui ，mac  windows and other
+### OPUI
+原生 Golang gui 
 
-## TODO 
+### TODO 
+
  继续完善 openGl 的SDK
  添加按钮模版，支持拖拽布局。
- 欢迎大家的 fork star 
+ 欢迎大家的 Fork Star 
  
  
- ## quick start
+ ### quick start
  
  
  ```bash
@@ -15,13 +16,12 @@
  ```
 
 
- ## Demo 
+ ### Demo 
 
   * Demo show 
 
     ![](http://zmatsh.b0.upaiyun.com/OPUI.png)
 
-
     ![](http://zmatsh.b0.upaiyun.com/OPUI_1.png)
 
-### 作者：陈成涛（Go的入门导师）
+##### 作者：陈成涛（Go的入门导师）
